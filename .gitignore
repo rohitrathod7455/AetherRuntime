@@ -1,0 +1,23 @@
+# Binaries and build artifacts
+bin/
+*.exe
+*.test
+
+# Root Filesystem (downloaded & unpacked via scripts/setup-rootfs.sh)
+rootfs/
+*.tar.gz
+
+# Runtime Logs
+logs/
+*.log
+
+# Frontend dependencies and builds
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.vite/
+
+# OS and Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
