@@ -137,47 +137,50 @@ function App() {
   const recentCommandsRef = useRef<Map<string, { id: string; ts: number }>>(new Map());
   const DEDUP_WINDOW_MS = 10000; // 10-second dedup window
 
-  // Simulate memory history ticking for all containers
+  // Ref to always hold latest containers for the timer to read without nested setState
+  const containersRef = useRef<Container[]>(containers);
+  useEffect(() => { containersRef.current = containers; }, [containers]);
+
+  // Simulate memory ticking — all containers get realistic memory fluctuation
   useEffect(() => {
     const timer = setInterval(() => {
-      setContainers(prev => prev.map(c => {
-        if (c.status !== "Running") return c;
-        const vel = c.metrics?.memory_velocity || 0;
-        const delta = (vel / 1024 / 1024) * (0.5 + Math.random() * 0.5);
-        const newMem = c.metrics.memory_usage + delta * 1024 * 1024 * 0.3;
-        const maxMem = parseInt(c.profile.memory_max) || 1073741824;
-        return {
-          ...c,
-          metrics: {
-            ...c.metrics,
-            memory_usage: Math.min(newMem, maxMem * 0.95),
-            cpu_usage: Math.max(0.5, c.metrics.cpu_usage + (Math.random() - 0.5) * 1.2),
+      setContainers(prev => {
+        const updated = prev.map(c => {
+          if (c.status !== "Running") return c;
+          // All containers fluctuate; compute-heavy grows faster
+          const baseVel = c.metrics?.memory_velocity || 0;
+          const jitter = (Math.random() - 0.3) * 0.8; // slight upward bias
+          const velMB = baseVel > 0 ? (baseVel / 1024 / 1024) * (0.3 + Math.random() * 0.4) : jitter;
+          const newMem = c.metrics.memory_usage + velMB * 1024 * 1024;
+          const maxMem = parseInt(c.profile.memory_max) || 1073741824;
+          const clampedMem = Math.max(c.metrics.memory_usage * 0.85, Math.min(newMem, maxMem * 0.9));
+          return {
+            ...c,
+            metrics: {
+              ...c.metrics,
+              memory_usage: clampedMem,
+              cpu_usage: Math.max(0.5, c.metrics.cpu_usage + (Math.random() - 0.5) * 1.2),
+            }
+          };
+        });
+        // Side-effect: update history from freshly computed containers
+        const historyPoints: Record<string, number> = {};
+        let totalMem = 0;
+        updated.forEach(c => {
+          const memMB = (c.metrics?.memory_usage || 0) / 1024 / 1024;
+          totalMem += memMB;
+          historyPoints[c.id] = memMB;
+        });
+        setHistory(prev => {
+          const next = { ...prev };
+          for (const [id, memMB] of Object.entries(historyPoints)) {
+            if (!next[id]) next[id] = Array(7).fill(memMB);
+            next[id] = [...next[id].slice(-19), memMB];
           }
-        };
-      }));
-
-      // Update per-container memory history
-      setHistory(prev => {
-        const next = { ...prev };
-        setContainers(cs => {
-          cs.forEach(c => {
-            const memMB = (c.metrics?.memory_usage || 0) / 1024 / 1024;
-            if (!next[c.id]) next[c.id] = Array(7).fill(memMB);
-            next[c.id] = [...next[c.id].slice(-19), memMB];
-          });
-          return cs; // don't modify containers
+          return next;
         });
-        return next;
-      });
-
-      // Update node memory history
-      setNodeMemHistory(prev => {
-        let total = 0;
-        setContainers(cs => {
-          total = cs.reduce((acc, c) => acc + (c.metrics?.memory_usage || 0), 0);
-          return cs;
-        });
-        return [...prev.slice(-19), total / 1024 / 1024];
+        setNodeMemHistory(prev => [...prev.slice(-19), totalMem]);
+        return updated;
       });
     }, 2000);
 
