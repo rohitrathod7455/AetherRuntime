@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Activity, Shield, Cpu, HardDrive, Terminal, Pause, Play, Maximize2, X, Sparkles, CheckCircle2 } from 'lucide-react';
 import ReactECharts from 'echarts-for-react';
@@ -117,14 +117,72 @@ function App() {
   const [optNS, setOptNS] = useState(true);
   
   const [termInput, setTermInput] = useState("");
-  const [termOutput, setTermOutput] = useState<string[]>([
-    "aether-shell$ Connected to isolated Alpine container sandbox",
-    "aether-shell$ Type 'ip a', 'uname -a', or 'ls -la /'"
-  ]);
+  // Per-container terminal output: { [containerId]: string[] }
+  const [termOutputs, setTermOutputs] = useState<Record<string, string[]>>({
+    "c-894210": [
+      "aether-shell$ Connected to isolated Alpine container sandbox",
+      "aether-shell$ Type 'ip a', 'uname -a', or 'ls -la /'"
+    ],
+    "c-310542": [
+      "aether-shell$ Connected to isolated Alpine container sandbox",
+      "aether-shell$ Type 'ip a', 'uname -a', or 'ls -la /'"
+    ],
+  });
 
   const [autoInput, setAutoInput] = useState("");
   const [isAutoLoading, setIsAutoLoading] = useState(false);
   const [latestAutopilot, setLatestAutopilot] = useState<AutopilotResult | null>(null);
+
+  // Track recently run commands to route duplicates to existing containers
+  const recentCommandsRef = useRef<Map<string, { id: string; ts: number }>>(new Map());
+  const DEDUP_WINDOW_MS = 10000; // 10-second dedup window
+
+  // Simulate memory history ticking for all containers
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setContainers(prev => prev.map(c => {
+        if (c.status !== "Running") return c;
+        const vel = c.metrics?.memory_velocity || 0;
+        const delta = (vel / 1024 / 1024) * (0.5 + Math.random() * 0.5);
+        const newMem = c.metrics.memory_usage + delta * 1024 * 1024 * 0.3;
+        const maxMem = parseInt(c.profile.memory_max) || 1073741824;
+        return {
+          ...c,
+          metrics: {
+            ...c.metrics,
+            memory_usage: Math.min(newMem, maxMem * 0.95),
+            cpu_usage: Math.max(0.5, c.metrics.cpu_usage + (Math.random() - 0.5) * 1.2),
+          }
+        };
+      }));
+
+      // Update per-container memory history
+      setHistory(prev => {
+        const next = { ...prev };
+        setContainers(cs => {
+          cs.forEach(c => {
+            const memMB = (c.metrics?.memory_usage || 0) / 1024 / 1024;
+            if (!next[c.id]) next[c.id] = Array(7).fill(memMB);
+            next[c.id] = [...next[c.id].slice(-19), memMB];
+          });
+          return cs; // don't modify containers
+        });
+        return next;
+      });
+
+      // Update node memory history
+      setNodeMemHistory(prev => {
+        let total = 0;
+        setContainers(cs => {
+          total = cs.reduce((acc, c) => acc + (c.metrics?.memory_usage || 0), 0);
+          return cs;
+        });
+        return [...prev.slice(-19), total / 1024 / 1024];
+      });
+    }, 2000);
+
+    return () => clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     let sse: EventSource | null = null;
@@ -171,7 +229,7 @@ function App() {
     };
   }, []);
 
-  const simulateAutopilot = (cmd: string): AutopilotResult => {
+  const simulateAutopilot = useCallback((cmd: string): AutopilotResult => {
     const cmdLower = cmd.toLowerCase();
     let intent = "general-task";
     let confidence = 0.96;
@@ -225,11 +283,34 @@ function App() {
       };
     }
 
+    // Check for duplicate command within dedup window → route to existing container
+    const now = Date.now();
+    const cmdKey = cmd.trim().toLowerCase();
+    const existing = recentCommandsRef.current.get(cmdKey);
+    if (existing && (now - existing.ts) < DEDUP_WINDOW_MS) {
+      // Same command within window → reuse container, update output
+      const existingId = existing.id;
+      setEvents(prev => [
+        `ML-ENGINE: Duplicate detected '${cmd.slice(0, 24)}...' → routing to existing container ${existingId}.`,
+        ...prev.slice(0, 45)
+      ]);
+      return {
+        id: existingId,
+        intent,
+        confidence,
+        probabilities,
+        namespaces: [],
+        output: `[Aether Sandbox ${existingId}]\nRe-executing in existing rootfs jail (Alpine Linux minirootfs)\nCommand: "${cmd}"\nSeccomp-BPF: 14 dangerous syscalls filtered.\nStatus: Process re-used in existing isolated namespace.`,
+        command: cmd,
+      };
+    }
+
     const id = `auto-${Math.floor(Math.random() * 90000 + 10000)}`;
     const namespaces = ["NEWUTS (Hostname)", "NEWNS (Mounts)", "NEWPID (Process)"];
     if (intent !== "network-task") namespaces.push("NEWNET (Airgapped)");
     if (intent === "untrusted-dangerous" || intent === "compute-heavy") namespaces.push("NEWIPC (Isolated)");
 
+    const initMem = intent === "compute-heavy" ? 45 : intent === "untrusted-dangerous" ? 8 : 18;
     const newContainer: Container = {
       id,
       pid: Math.floor(Math.random() * 20000 + 1000),
@@ -250,7 +331,7 @@ function App() {
       namespaces,
       metrics: {
         cpu_usage: intent === "compute-heavy" ? 45.2 : 1.8,
-        memory_usage: 18 * 1024 * 1024,
+        memory_usage: initMem * 1024 * 1024,
         memory_velocity: intent === "compute-heavy" ? 2097152 : 0,
       },
       isolation_score: intent === "untrusted-dangerous" ? 100 : 95,
@@ -258,10 +339,29 @@ function App() {
     };
 
     setContainers(prev => [newContainer, ...prev]);
+
+    // Initialize memory history for this container so the graph works immediately
+    setHistory(prev => ({
+      ...prev,
+      [id]: [initMem * 0.6, initMem * 0.7, initMem * 0.8, initMem * 0.85, initMem * 0.9, initMem * 0.95, initMem]
+    }));
+
+    // Initialize per-container terminal output
+    setTermOutputs(prev => ({
+      ...prev,
+      [id]: [
+        `aether-shell$ Connected to isolated container ${id}`,
+        `aether-shell$ Sandbox: Alpine Linux minirootfs | Intent: ${intent}`,
+      ]
+    }));
+
     setEvents(prev => [
       `ML-ENGINE: Inferred '${cmd.slice(0, 24)}...' -> ${intent} (${(confidence * 100).toFixed(1)}%). Spawning ${id}.`,
       ...prev.slice(0, 45)
     ]);
+
+    // Register for dedup
+    recentCommandsRef.current.set(cmdKey, { id, ts: now });
 
     return {
       id,
@@ -272,7 +372,7 @@ function App() {
       output: `[Aether Sandbox ${id}]\nExecuting in rootfs jail (Alpine Linux minirootfs)\nCommand: "${cmd}"\nSeccomp-BPF: 14 dangerous syscalls filtered.\nStatus: Process active in isolated namespace.`,
       command: cmd,
     };
-  };
+  }, []);
 
   const runAutopilot = async () => {
     if (!autoInput.trim()) return;
@@ -321,6 +421,7 @@ function App() {
       if (!res.ok) throw new Error("Fallback to demo");
     } catch {
       const id = `c-${Math.floor(Math.random() * 900000 + 100000)}`;
+      const initMem = 12;
       const newC: Container = {
         id,
         pid: Math.floor(Math.random() * 20000 + 1000),
@@ -347,52 +448,72 @@ function App() {
         ],
         metrics: {
           cpu_usage: 0.8,
-          memory_usage: 12 * 1024 * 1024,
+          memory_usage: initMem * 1024 * 1024,
           memory_velocity: 0,
         },
         isolation_score: 100,
         seccomp_rules: 14,
       };
       setContainers(prev => [newC, ...prev]);
+      setHistory(prev => ({
+        ...prev,
+        [id]: [initMem * 0.5, initMem * 0.6, initMem * 0.7, initMem * 0.8, initMem * 0.85, initMem * 0.9, initMem]
+      }));
+      setTermOutputs(prev => ({
+        ...prev,
+        [id]: [
+          `aether-shell$ Connected to isolated container ${id}`,
+          `aether-shell$ Sandbox: Alpine Linux minirootfs | Intent: ${intentInput}`,
+        ]
+      }));
       setEvents(prev => [`SYSTEM: Spawned manual container ${id} with intent '${intentInput}'`, ...prev.slice(0, 45)]);
     }
   };
 
   const runTermCommand = async () => {
     if (!selectedContainer || !termInput) return;
-    setTermOutput(prev => [...prev, `aether-shell$ ${termInput}`]);
+    const cid = selectedContainer.id;
     const cmd = termInput;
+
+    // Add command to THIS container's terminal only
+    setTermOutputs(prev => ({
+      ...prev,
+      [cid]: [...(prev[cid] || []), `aether-shell$ ${cmd}`]
+    }));
     setTermInput("");
+
     try {
-      const res = await fetch(`${API_BASE}/api/containers/${selectedContainer.id}/exec`, {
+      const res = await fetch(`${API_BASE}/api/containers/${cid}/exec`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ command: cmd })
       });
       const data = await res.json();
-      setTermOutput(prev => [...prev, data.output]);
+      setTermOutputs(prev => ({
+        ...prev,
+        [cid]: [...(prev[cid] || []), data.output]
+      }));
     } catch {
+      let output: string;
       if (cmd.includes("ip a")) {
-        setTermOutput(prev => [
-          ...prev,
-          "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n(Notice: External eth0 network namespace is completely airgapped)"
-        ]);
+        output = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n(Notice: External eth0 network namespace is completely airgapped)";
       } else if (cmd.includes("ls")) {
-        setTermOutput(prev => [
-          ...prev,
-          "bin   dev   etc   home  lib   media mnt   opt   proc  root  run   sbin  srv   sys   tmp   usr   var"
-        ]);
+        output = "bin   dev   etc   home  lib   media mnt   opt   proc  root  run   sbin  srv   sys   tmp   usr   var";
       } else if (cmd.includes("uname")) {
-        setTermOutput(prev => [
-          ...prev,
-          "Linux aether-sandbox 6.18.33 #1 SMP PREEMPT_DYNAMIC x86_64 Linux"
-        ]);
+        output = "Linux aether-sandbox 6.18.33 #1 SMP PREEMPT_DYNAMIC x86_64 Linux";
+      } else if (cmd.includes("whoami")) {
+        output = "root (sandboxed — no host privileges)";
+      } else if (cmd.includes("ps")) {
+        output = `PID   USER     TIME  COMMAND\n    1 root      0:00 /bin/sh\n    ${Math.floor(Math.random() * 90 + 10)} root      0:00 ${cmd}\n(Container PID namespace: host PIDs hidden)`;
+      } else if (cmd.includes("cat /etc")) {
+        output = "root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/:/sbin/nologin\n(Sandboxed /etc — host filesystem isolated via pivot_root)";
       } else {
-        setTermOutput(prev => [
-          ...prev,
-          `[aether-container ${selectedContainer.id.substring(0, 6)}] Executed: ${cmd}\nExit Code: 0 (Isolated sandbox environment)`
-        ]);
+        output = `[aether-container ${cid.substring(0, 8)}] Executed: ${cmd}\nExit Code: 0 (Isolated sandbox environment)`;
       }
+      setTermOutputs(prev => ({
+        ...prev,
+        [cid]: [...(prev[cid] || []), output]
+      }));
     }
   };
 
@@ -455,12 +576,18 @@ function App() {
     }]
   };
 
+  // Get terminal output for the selected container
+  const currentTermOutput = selectedContainer ? (termOutputs[selectedContainer.id] || [
+    `aether-shell$ Connected to isolated container ${selectedContainer.id}`,
+    "aether-shell$ Type 'ip a', 'uname -a', or 'ls -la /'"
+  ]) : [];
+
   return (
-    <div className="h-screen w-screen flex flex-col p-6 bg-[#0a0a0c] overflow-hidden font-sans text-white relative">
+    <div className="min-h-screen w-screen flex flex-col p-6 bg-[#0a0a0c] font-sans text-white relative overflow-x-hidden">
       <div className="absolute top-[-20%] left-[-10%] w-[50%] h-[50%] rounded-full bg-indigo-500/10 blur-[120px] pointer-events-none"></div>
       <div className="absolute bottom-[-20%] right-[-10%] w-[40%] h-[40%] rounded-full bg-blue-500/10 blur-[100px] pointer-events-none"></div>
 
-      <header className="flex justify-between items-center mb-6 relative z-10">
+      <header className="flex justify-between items-center mb-6 relative z-10 flex-shrink-0">
         <div className="flex items-center gap-4">
           <div className="relative flex items-center justify-center h-12 w-12 rounded-xl bg-gradient-to-br from-indigo-500/20 to-blue-500/10 border border-indigo-500/30 shadow-[0_0_25px_rgba(99,102,241,0.2)]">
             <Activity className="text-indigo-400 w-6 h-6" />
@@ -511,8 +638,8 @@ function App() {
       </header>
 
       <main className="flex-1 grid grid-cols-12 gap-6 min-h-0 relative z-10">
-        <div className="col-span-4 flex flex-col gap-6 h-full">
-          <div className="rounded-2xl bg-black/40 border border-zinc-800/80 backdrop-blur-xl p-5 shadow-xl flex flex-col h-[38%] relative overflow-hidden">
+        <div className="col-span-4 flex flex-col gap-6">
+          <div className="rounded-2xl bg-black/40 border border-zinc-800/80 backdrop-blur-xl p-5 shadow-xl flex flex-col h-72 relative overflow-hidden">
             <div className="absolute inset-0 bg-gradient-to-b from-indigo-500/5 to-transparent pointer-events-none"></div>
             <h2 className="text-sm font-semibold text-zinc-200 mb-3 flex items-center gap-2 uppercase tracking-widest relative z-10">
               <Cpu className="w-4 h-4 text-indigo-400" /> Node Telemetry
@@ -532,8 +659,8 @@ function App() {
             </div>
           </div>
 
-          <div className="flex-1 rounded-2xl bg-black/40 border border-zinc-800/80 backdrop-blur-xl flex flex-col overflow-hidden shadow-xl">
-            <div className="p-4 border-b border-zinc-800/80 bg-zinc-900/30 flex justify-between items-center">
+          <div className="rounded-2xl bg-black/40 border border-zinc-800/80 backdrop-blur-xl flex flex-col overflow-hidden shadow-xl min-h-[320px] max-h-[500px]">
+            <div className="p-4 border-b border-zinc-800/80 bg-zinc-900/30 flex justify-between items-center flex-shrink-0">
               <h2 className="text-sm font-semibold text-zinc-200 flex items-center gap-2 uppercase tracking-widest">
                 <HardDrive className="w-4 h-4 text-pink-400" /> Causal Audit Trail
               </h2>
@@ -569,7 +696,7 @@ function App() {
         </div>
 
         <div className="col-span-8 flex flex-col gap-5 relative">
-          <div className="rounded-2xl bg-zinc-900/70 border border-indigo-500/30 backdrop-blur-xl p-4 shadow-[0_0_30px_rgba(99,102,241,0.1)] flex flex-col gap-3">
+          <div className="rounded-2xl bg-zinc-900/70 border border-indigo-500/30 backdrop-blur-xl p-4 shadow-[0_0_30px_rgba(99,102,241,0.1)] flex flex-col gap-3 flex-shrink-0">
             <div className="flex justify-between items-center">
               <h2 className="text-sm font-semibold text-zinc-200 flex items-center gap-2 uppercase tracking-widest">
                 <Sparkles className="w-4 h-4 text-indigo-400" /> Naive Bayes Auto-Pilot Shell
@@ -642,8 +769,8 @@ function App() {
             )}
           </div>
 
-          <div className="flex-1 rounded-2xl bg-black/40 border border-zinc-800/80 backdrop-blur-xl relative flex flex-col shadow-xl overflow-hidden min-h-0">
-            <div className="p-4 border-b border-zinc-800/80 bg-zinc-900/30 flex justify-between items-center">
+          <div className="flex-1 rounded-2xl bg-black/40 border border-zinc-800/80 backdrop-blur-xl relative flex flex-col shadow-xl overflow-hidden min-h-[300px]">
+            <div className="p-4 border-b border-zinc-800/80 bg-zinc-900/30 flex justify-between items-center flex-shrink-0">
               <h2 className="text-sm font-semibold text-zinc-200 flex items-center gap-2 uppercase tracking-widest">
                 <Shield className="w-4 h-4 text-emerald-400" /> Active Topology & Cgroup Sandboxes
               </h2>
@@ -688,7 +815,7 @@ function App() {
                           <div className="flex justify-between items-start">
                             <div>
                               <div className="flex items-center gap-2 mb-1.5">
-                                <h4 className="text-zinc-200 font-mono font-bold text-base">{c.id.substring(0, 8)}</h4>
+                                <h4 className="text-zinc-200 font-mono font-bold text-base">{c.id.substring(0, 10)}</h4>
                                 <span className={`text-[9px] font-mono font-bold px-2 py-0.5 rounded uppercase tracking-wider ${isFrozen ? 'bg-blue-500/20 text-blue-400' : c.status === 'Running' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'}`}>
                                   {c.status}
                                 </span>
@@ -741,12 +868,13 @@ function App() {
             animate={{ opacity: 1 }} 
             exit={{ opacity: 0 }} 
             className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-8"
+            onClick={(e) => { if (e.target === e.currentTarget) setSelectedContainer(null); }}
           >
             <motion.div 
               layoutId={`card-${selectedContainer.id}`}
-              className="w-full max-w-4xl bg-zinc-900 border border-zinc-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col"
+              className="w-full max-w-4xl bg-zinc-900 border border-zinc-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
             >
-              <div className="p-6 border-b border-zinc-800 flex justify-between items-center bg-black/20">
+              <div className="p-6 border-b border-zinc-800 flex justify-between items-center bg-black/20 flex-shrink-0">
                 <div>
                   <h2 className="text-xl font-bold font-mono text-white flex items-center gap-3">
                     {selectedContainer.id}
@@ -778,7 +906,7 @@ function App() {
                 </div>
               </div>
               
-              <div className="p-6 bg-black/40 flex flex-col gap-6">
+              <div className="p-6 bg-black/40 flex flex-col gap-6 overflow-y-auto">
                 <div className="grid grid-cols-2 gap-6">
                   <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-5 h-64 flex flex-col">
                     <div className="text-xs text-zinc-500 font-mono mb-2">MEMORY TRAJECTORY (MB)</div>
@@ -787,7 +915,7 @@ function App() {
                         option={{
                           animation: false, grid: { top: 10, right: 10, bottom: 20, left: 40 },
                           xAxis: { type: 'category', show: false },
-                          yAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(255,255,255,0.05)' } } },
+                          yAxis: { type: 'value', splitLine: { lineStyle: { color: 'rgba(255,255,255,0.05)' } }, axisLabel: { color: '#666' } },
                           series: [{
                             data: history[selectedContainer.id] || [],
                             type: 'line', smooth: true, symbol: 'none',
@@ -823,13 +951,13 @@ function App() {
 
                 <div className="bg-zinc-950 rounded-xl border border-zinc-800 p-4 h-64 flex flex-col font-mono">
                   <div className="text-xs text-zinc-500 mb-2 flex items-center justify-between">
-                    <span>LIVE INTERACTIVE SHELL (nsenter)</span>
+                    <span>LIVE INTERACTIVE SHELL — Container: {selectedContainer.id}</span>
                     <span className="text-[9px] bg-emerald-500/10 text-emerald-400 px-2 py-0.5 rounded border border-emerald-500/20">
                       {connected ? 'CONNECTED (KERNEL)' : 'ACTIVE (SANDBOX)'}
                     </span>
                   </div>
                   <div className="flex-1 overflow-y-auto bg-black rounded p-3 text-sm text-zinc-300 leading-relaxed break-all">
-                    {termOutput.map((line, i) => (
+                    {currentTermOutput.map((line, i) => (
                       <div key={i} className={line.startsWith('aether-shell$') ? 'text-indigo-400 mt-1' : 'whitespace-pre-wrap'}>
                         {line}
                       </div>
